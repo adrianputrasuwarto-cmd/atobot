@@ -1,0 +1,28 @@
+name: AtoBot saran XAUUSD
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"     # tiap 15 menit (GitHub bisa terlambat beberapa menit)
+  workflow_dispatch:            # tombol "Run workflow" untuk coba manual
+
+jobs:
+  saran:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - name: Jalankan bot
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TWELVE_API_KEY: ${{ secrets.TWELVE_API_KEY }}
+          EQUITY: "990"
+          CCY: "EUR"
+          RISK: "1.0"
+          LAYERS: "2"
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && '1' || '' }}
+        run: python atobot_cloud.py
