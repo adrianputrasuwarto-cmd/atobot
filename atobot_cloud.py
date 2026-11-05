@@ -10,6 +10,8 @@ Rahasia dibaca dari environment (GitHub Secrets):
   TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, TWELVE_API_KEY
 Pengaturan opsional (GitHub Variables / env):
   EQUITY=990  CCY=EUR  RISK=1.0  LAYERS=2  NEAR_ATR=0.3  SUMMARY=1
+  MODE=scalp (zona M15+M30, peta H1) atau swing (zona H1+H4)
+  FAR_ATR=1.5  ALERT_EVERY=30 (menit, jeda alert dekat zona)
   FORCE=1  -> kirim ringkasan sekarang (dipakai tombol Run manual)
   MOCK=1   -> data tiruan untuk uji tanpa internet (tidak kirim Telegram)
 """
@@ -45,6 +47,17 @@ FORCE = os.environ.get("FORCE", "").strip() == "1"
 MOCK = os.environ.get("MOCK", "").strip() == "1"
 SYMBOL = os.environ.get("SYMBOL", "XAU/USD").strip()
 CONTRACT = fenv("CONTRACT", 100.0)      # oz per 1 lot
+MODE = (os.environ.get("MODE", "").strip().lower() or "scalp")
+FAR_ATR = fenv("FAR_ATR", 1.5)           # zona lebih jauh dari ini (x ATR) ditandai "tunggu"
+ALERT_EVERY = int(fenv("ALERT_EVERY", 30))
+FX_FALLBACK = fenv("FX_FALLBACK", 1.10)  # EUR/USD cadangan bila gagal diambil
+
+
+def tf_config():
+    """(nama, interval Twelve Data, jumlah candle diminta, lookback zona)"""
+    if MODE == "swing":
+        return [("H1", "1h", 300, 120), ("H4", "4h", 260, 200)]
+    return [("M15", "15min", 220, 120), ("M30", "30min", 220, 120), ("H1", "1h", 300, 120)]
 
 # Parameter zona (sama dengan cBot)
 BASE_BODY_ATR = 0.5
@@ -53,7 +66,7 @@ LEG_IN_ATR = 1.0
 IMPULSE_ATR = 1.5
 IMPULSE_BARS = 6
 MAX_ZONE_ATR = 2.5
-LOOKBACK = 120
+SWING_K = 3
 MIN_GAP_ATR = 0.10
 CL_BUF_ATR = 0.10
 SL_BUF_ATR = 0.10
@@ -73,22 +86,23 @@ def td_get(path, **params):
 
 
 def get_bars(interval, size):
-    """Candle TERTUTUP, terbaru dulu. Candle pertama dari API (masih berjalan) dibuang."""
+    """Candle TERTUTUP (terbaru dulu) dan harga terakhir (close candle yang masih berjalan)."""
     d = td_get("time_series", symbol=SYMBOL, interval=interval, outputsize=size)
     rows = d.get("values") or []
     bars = [{"t": v["datetime"], "o": float(v["open"]), "h": float(v["high"]),
              "l": float(v["low"]), "c": float(v["close"])} for v in rows]
-    return bars[1:]
-
-
-def get_price():
-    return float(td_get("price", symbol=SYMBOL)["price"])
+    if len(bars) < 2:
+        raise RuntimeError("Data " + interval + " kosong.")
+    return bars[1:], bars[0]["c"]
 
 
 def usd_per_ccy():
     if CCY == "USD":
         return 1.0
-    return float(td_get("price", symbol=CCY + "/USD")["price"])
+    try:
+        return float(td_get("price", symbol=CCY + "/USD")["price"])
+    except Exception:
+        return FX_FALLBACK
 
 
 def mock_bars(n, step, seed):
@@ -133,7 +147,7 @@ def has_fvg(L, start_idx, lowest_idx, supply):
     return False
 
 
-def find_zones(b, tf_name):
+def find_zones(b, tf_name, lookback, stats):
     """Port ComputePacZonesFor. Indeks Last(j) -> b[j-1] (Last(1) = candle tertutup terbaru)."""
     def L(j):
         return b[j - 1]
@@ -144,7 +158,7 @@ def find_zones(b, tf_name):
     if atr <= 0:
         return []
     W = IMPULSE_BARS
-    n = min(len(b) - 1, LOOKBACK)
+    n = min(len(b) - 1, lookback)
     if n < W + 8:
         return []
     min_h = 0.15 * atr
@@ -235,6 +249,7 @@ def find_zones(b, tf_name):
                     broken = True
                     break
             if broken:
+                stats["S_broken" if supply else "D_broken"].add((round(top, 1), round(bottom, 1)))
                 continue
 
             tested = False
@@ -272,13 +287,16 @@ def find_zones(b, tf_name):
     return zones
 
 
-def merge_2tf(z1, z2):
-    for a in z1:
-        for c in z2:
-            if a["supply"] == c["supply"] and not (a["top"] < c["bottom"] or a["bottom"] > c["top"]):
-                a["both"] = True
-                c["both"] = True
-    return z1 + z2
+def merge_all(lists):
+    """Tandai zona yang tumpang tindih dengan zona sejenis dari timeframe lain (+2TF)."""
+    for i in range(len(lists)):
+        for j in range(i + 1, len(lists)):
+            for x in lists[i]:
+                for y in lists[j]:
+                    if x["supply"] == y["supply"] and not (x["top"] < y["bottom"] or x["bottom"] > y["top"]):
+                        x["both"] = True
+                        y["both"] = True
+    return [z for l in lists for z in l]
 
 
 def pick_zone(zones, buy, price, gap):
@@ -297,6 +315,43 @@ def pick_zone(zones, buy, price, gap):
     return best
 
 
+def swing_levels(b, lookback):
+    """Swing high/low (K candle di kiri dan kanan lebih rendah/tinggi). b terbaru dulu."""
+    k = SWING_K
+    n = min(len(b) - 1, lookback)
+    highs, lows = [], []
+    for p in range(k + 1, n - k + 1):
+        hi, lo = b[p - 1]["h"], b[p - 1]["l"]
+        sh = all(b[p - 1 - j]["h"] < hi and b[p - 1 + j]["h"] <= hi for j in range(1, k + 1))
+        sl = all(b[p - 1 - j]["l"] > lo and b[p - 1 + j]["l"] >= lo for j in range(1, k + 1))
+        if sh:
+            highs.append(hi)
+        if sl:
+            lows.append(lo)
+    return highs, lows
+
+
+def fallback_zone(buy, price, gap, atr_ref, highs, lows, tf_name):
+    """Cadangan bila tidak ada zona base: resistance/support dari swing terdekat (kualitas lebih rendah)."""
+    if buy:
+        c = [x for x in lows if x < price - gap]
+        if not c:
+            return None
+        lvl = max(c)
+        top = min(lvl + 0.25 * atr_ref, price - gap)
+        bottom = min(lvl, top - 0.15 * atr_ref)
+    else:
+        c = [x for x in highs if x > price + gap]
+        if not c:
+            return None
+        lvl = min(c)
+        bottom = max(lvl - 0.25 * atr_ref, price + gap)
+        top = max(lvl, bottom + 0.15 * atr_ref)
+    return {"supply": not buy, "top": top, "bottom": bottom, "extreme": lvl, "distal": lvl,
+            "atr": atr_ref, "pattern": "Swing", "tested": False, "tf": tf_name,
+            "fvg": False, "sweep": False, "both": False, "weak": True}
+
+
 def pivots_d1(d1):
     """Pivot klasik dari candle D1 tertutup terakhir."""
     x = d1[0]
@@ -304,13 +359,18 @@ def pivots_d1(d1):
     return pp, 2 * pp - x["l"], 2 * pp - x["h"]    # PP, R1, S1
 
 
-def build_plan(buy, zones, price, atr_ref, pv, usd_pc):
-    gap = MIN_GAP_ATR * atr_ref
-    z = pick_zone(zones, buy, price, gap)
-    if z is None:
-        return None
-    start = z["top"] if buy else z["bottom"]
-    end = z["bottom"] if buy else z["top"]
+def zone_start_end(z, buy):
+    return (z["top"], z["bottom"]) if buy else (z["bottom"], z["top"])
+
+
+def is_near(z, buy, price):
+    start, end = zone_start_end(z, buy)
+    inside = (end <= price <= start) if buy else (start <= price <= end)
+    return inside or abs(price - start) <= NEAR_ATR * z["atr"]
+
+
+def build_plan(buy, z, zones, price, pv, usd_pc):
+    start, end = zone_start_end(z, buy)
     za = z["atr"]
     cut = end - CL_BUF_ATR * za if buy else end + CL_BUF_ATR * za
     sl = cut - SL_BUF_ATR * za if buy else cut + SL_BUF_ATR * za
@@ -329,9 +389,8 @@ def build_plan(buy, zones, price, atr_ref, pv, usd_pc):
     n = max(1, LAYERS)
     entries = [start if n == 1 else start + (end - start) * i / (n - 1) for i in range(n)]
 
-    # Layer tengah menempel ke Fibonacci impuls bila jatuh di dalam zona
     snap = []
-    if n >= 3:
+    if n >= 3 and not z.get("weak"):
         rng = abs(z["extreme"] - z["distal"])
         tol = 0.25 * (z["top"] - z["bottom"])
         used = []
@@ -349,21 +408,24 @@ def build_plan(buy, zones, price, atr_ref, pv, usd_pc):
                 entries[i] = (z["extreme"] - FIB_RATIOS[best] * rng) if buy else (z["extreme"] + FIB_RATIOS[best] * rng)
                 snap.append(FIB_NAMES[best])
 
-    loss_per_lot_usd = sum(abs(e - sl) * CONTRACT for e in entries)
-    loss_per_lot = loss_per_lot_usd / usd_pc
+    loss_per_lot = sum(abs(e - sl) * CONTRACT for e in entries) / usd_pc
     risk_money = EQUITY * RISK / 100.0
     lot = math.floor((risk_money / loss_per_lot if loss_per_lot > 0 else 0) * 100 + 1e-9) / 100
     below = lot < 0.01
     if below:
         lot = 0.01
     est_loss = loss_per_lot * lot
-    tag = (z["tf"] + " " if True else "") + z["pattern"] + ("+FVG" if z["fvg"] else "") + \
-        ("+Sweep" if z["sweep"] else "") + ("+2TF" if z["both"] else "") + (" (tested)" if z["tested"] else "")
+    if z.get("weak"):
+        tag = ("Support" if buy else "Resistance") + " swing (kualitas lebih rendah, bukan zona base)"
+    else:
+        tag = z["tf"] + " " + z["pattern"] + ("+FVG" if z["fvg"] else "") + ("+Sweep" if z["sweep"] else "") + \
+            ("+2TF" if z["both"] else "") + (" (tested)" if z["tested"] else "")
+    dist = abs(price - start)
     return {
         "buy": buy, "start": start, "end": end, "cut": cut, "sl": sl, "tp": tp,
         "entries": entries, "lot": lot, "est_loss": est_loss, "pct": est_loss / EQUITY * 100.0,
-        "below": below, "tag": tag, "snap": snap, "dist": abs(price - start),
-        "near": abs(price - start) <= NEAR_ATR * za or (end <= price <= start if buy else start <= price <= end),
+        "below": below, "tag": tag, "snap": snap, "dist": dist, "dist_atr": dist / za,
+        "far": dist / za > FAR_ATR, "weak": bool(z.get("weak")),
     }
 
 
@@ -371,7 +433,7 @@ def p2(v):
     return f"{v:.2f}"
 
 
-def fmt_plan(pl, price):
+def fmt_plan(pl):
     side = "BUY LIMIT" if pl["buy"] else "SELL LIMIT"
     arrow = "▲" if pl["buy"] else "▼"
     lines = [
@@ -381,10 +443,12 @@ def fmt_plan(pl, price):
         f"   Cut Loss {p2(pl['cut'])} | SL {p2(pl['sl'])} | TP {p2(pl['tp'])}",
         f"   {len(pl['entries'])} layer x {pl['lot']:.2f} lot = {pl['lot'] * len(pl['entries']):.2f} lot"
         f" | rugi di SL ±{pl['est_loss']:.2f} {CCY} ({pl['pct']:.1f}%)",
-        f"   Jarak dari harga: {pl['dist']:.1f} poin",
+        f"   Jarak dari harga: {pl['dist']:.1f} poin ({pl['dist_atr']:.1f} ATR)",
     ]
+    if pl["far"]:
+        lines.append(f"   ⏳ Terlalu jauh (> {FAR_ATR:.1f} ATR). Tunggu harga mendekat, jangan dikejar.")
     if pl["below"]:
-        lines.append(f"   ⚠ Lot minimum 0.01/layer melebihi risiko {RISK:.1f}%. Kurangi layer atau lewati.")
+        lines.append(f"   ⛔ LEWATI: lot minimum 0.01/layer membuat risiko {pl['pct']:.1f}%, di atas batas {RISK:.1f}%.")
     return "\n".join(lines)
 
 
@@ -409,6 +473,15 @@ def market_closed(now):
     return False
 
 
+def diag_text(zones, stats, price):
+    sup = [z for z in zones if z["supply"]]
+    dem = [z for z in zones if not z["supply"]]
+    s_above = sum(1 for z in sup if z["bottom"] > price)
+    d_below = sum(1 for z in dem if z["top"] < price)
+    return (f"Diagnosa: supply valid {len(sup)} (di atas harga {s_above}, ditembus {len(stats['S_broken'])}) | "
+            f"demand valid {len(dem)} (di bawah harga {d_below}, ditembus {len(stats['D_broken'])})")
+
+
 def main():
     now = dt.datetime.now(dt.timezone.utc)
     wib = now + dt.timedelta(hours=7)
@@ -421,53 +494,82 @@ def main():
             print("Pasar emas tutup, dilewati.")
             return 0
 
-    if MOCK:
-        h1 = mock_bars(300, 4.0, 1)
-        h4 = mock_bars(200, 12.0, 2)
-        d1 = mock_bars(40, 30.0, 3)
-        price = h1[0]["c"]
-        upc = 1.08 if CCY == "EUR" else 1.0
-    else:
-        h1 = get_bars("1h", 300)
-        h4 = get_bars("4h", 200)
-        d1 = get_bars("1day", 20)
-        price = get_price()
-        upc = usd_per_ccy()
+    cfg = tf_config()
+    bars, price = {}, None
+    for i, (name, interval, size, lb) in enumerate(cfg):
+        if MOCK:
+            step = {"M15": 3.0, "M30": 4.0, "H1": 5.0, "H4": 12.0}[name]
+            bars[name] = mock_bars(size, step, 10 + i)
+            last = bars[name][0]["c"]
+        else:
+            bars[name], last = get_bars(interval, size)
+        if price is None:
+            price = last
 
-    atr_h1 = atr14(h1)
-    zones = merge_2tf(find_zones(h1, "H1"), find_zones(h4, "H4"))
+    first = cfg[0][0]
+    atr_ref = atr14(bars[first])
+    gap = MIN_GAP_ATR * atr_ref
+    stats = {"S_broken": set(), "D_broken": set()}
+    lists = [find_zones(bars[name], name, lb, stats) for name, _, _, lb in cfg]
+    zones = merge_all(lists)
+
+    highs, lows = [], []
+    for name, _, _, lb in cfg:
+        h, l = swing_levels(bars[name], 200)
+        highs += h
+        lows += l
+
+    zb = pick_zone(zones, True, price, gap) or fallback_zone(True, price, gap, atr_ref, highs, lows, first)
+    zs = pick_zone(zones, False, price, gap) or fallback_zone(False, price, gap, atr_ref, highs, lows, first)
+
+    near_sides = [(buy, z) for buy, z in ((True, zb), (False, zs)) if z and is_near(z, buy, price)]
+    hourly = SUMMARY and wib.minute < 10
+    alert_ok = FORCE or (wib.minute % ALERT_EVERY) < 10
+    send_alert = bool(near_sides) and alert_ok
+    send_summary = (hourly or FORCE) and not near_sides
+
+    names = "+".join(n for n, _, _, _ in cfg)
+    if not (send_alert or send_summary):
+        print(f"Tidak ada yang perlu dikirim. Harga {p2(price)} ({names}).")
+        if not MOCK:
+            return 0
+
+    if MOCK or send_alert or send_summary:
+        if MOCK:
+            d1, _ = mock_bars(40, 30.0, 3), 0
+            d1 = d1
+            upc = 1.08 if CCY == "EUR" else 1.0
+        else:
+            d1, _ = get_bars("1day", 20)
+            upc = usd_per_ccy()
     pv = pivots_d1(d1)
-    buy = build_plan(True, zones, price, atr_h1, pv, upc)
-    sell = build_plan(False, zones, price, atr_h1, pv, upc)
+    pb = build_plan(True, zb, zones, price, pv, upc) if zb else None
+    ps = build_plan(False, zs, zones, price, pv, upc) if zs else None
 
-    head = (f"XAUUSD | {wib:%d %b %H:%M} WIB | harga {p2(price)} | ATR H1 {atr_h1:.1f}\n"
-            f"Pivot D1: PP {p2(pv[0])} R1 {p2(pv[1])} S1 {p2(pv[2])}")
-    near = [pl for pl in (buy, sell) if pl and pl["near"]]
-    hourly = SUMMARY and wib.minute < 15       # satu ringkasan per jam
+    head = (f"XAUUSD | {wib:%d %b %H:%M} WIB | harga {p2(price)} | ATR {first} {atr_ref:.1f}\n"
+            f"Mode {MODE.upper()} ({names}) | Pivot D1: PP {p2(pv[0])} R1 {p2(pv[1])} S1 {p2(pv[2])}")
     msgs = []
 
-    if near:
+    if send_alert:
         txt = ["🔔 HARGA DEKAT ZONA", head, ""]
-        for pl in near:
-            txt += [fmt_plan(pl, price), ""]
+        for pl in (pb, ps):
+            if pl and ((pl["buy"] and is_near(zb, True, price)) or ((not pl["buy"]) and is_near(zs, False, price))):
+                txt += [fmt_plan(pl), ""]
         txt.append("Saran saja. Cek berita dan spread sebelum entry.")
         msgs.append("\n".join(txt))
-    if (hourly or FORCE) and not near:
+    if send_summary or MOCK:
         txt = ["📊 RINGKASAN", head, ""]
-        txt.append(fmt_plan(buy, price) if buy else "▲ BUY: tidak ada zona demand valid di bawah harga.")
+        txt.append(fmt_plan(pb) if pb else "▲ BUY: tidak ada zona demand atau support swing di bawah harga.")
         txt.append("")
-        txt.append(fmt_plan(sell, price) if sell else "▼ SELL: tidak ada zona supply valid di atas harga.")
-        txt += ["", "Saran saja, bukan perintah. Hindari entry saat rilis data besar."]
-        msgs.append("\n".join(txt))
+        txt.append(fmt_plan(ps) if ps else "▼ SELL: tidak ada zona supply atau resistance swing di atas harga.")
+        txt += ["", diag_text(zones, stats, price), "Saran saja, bukan perintah. Hindari entry saat rilis data besar."]
+        summary_msg = "\n".join(txt)
+        if send_summary:
+            msgs.append(summary_msg)
 
     if MOCK:
-        print(head)
-        print(f"zona ditemukan: {len(zones)} (H1+H4)")
-        for z in zones:
-            print(" ", z["tf"], "SUPPLY" if z["supply"] else "DEMAND", z["pattern"],
-                  p2(z["bottom"]), "-", p2(z["top"]), "tested" if z["tested"] else "")
-        print(fmt_plan(buy, price) if buy else "BUY: tidak ada zona")
-        print(fmt_plan(sell, price) if sell else "SELL: tidak ada zona")
+        print(summary_msg)
+        print("near:", [("BUY" if b else "SELL") for b, _ in near_sides], "| alert_ok", alert_ok)
         return 0
 
     for m in msgs:
