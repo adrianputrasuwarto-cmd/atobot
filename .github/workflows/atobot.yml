@@ -2,7 +2,8 @@ name: AtoBot saran XAUUSD
 
 on:
   schedule:
-    - cron: "*/10 * * * *"     # tiap 10 menit (GitHub bisa terlambat beberapa menit)
+    - cron: "*/10 * * * *"     # cek tiap 10 menit (GitHub bisa terlambat atau melewatkan)
+    - cron: "0 * * * *"        # ringkasan tiap jam
   workflow_dispatch:            # tombol "Run workflow" untuk coba manual
 
 jobs:
@@ -26,6 +27,7 @@ jobs:
           LAYERS: "2"
           MODE: "scalp"          # scalp = zona M15+M30 (peta H1); swing = zona H1+H4
           FAR_ATR: "1.5"
-          ALERT_EVERY: "30"
+          ALERT_EVERY: "10"
+          SUMMARY_NOW: ${{ github.event.schedule == '0 * * * *' && '1' || '' }}
           FORCE: ${{ github.event_name == 'workflow_dispatch' && '1' || '' }}
         run: python atobot_cloud.py
