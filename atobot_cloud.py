@@ -49,7 +49,7 @@ SYMBOL = os.environ.get("SYMBOL", "XAU/USD").strip()
 CONTRACT = fenv("CONTRACT", 100.0)      # oz per 1 lot
 MODE = (os.environ.get("MODE", "").strip().lower() or "scalp")
 FAR_ATR = fenv("FAR_ATR", 1.5)           # zona lebih jauh dari ini (x ATR) ditandai "tunggu"
-ALERT_EVERY = int(fenv("ALERT_EVERY", 30))
+ALERT_EVERY = int(fenv("ALERT_EVERY", 10))   # 10 = alert di setiap putaran selama dekat zona
 FX_FALLBACK = fenv("FX_FALLBACK", 1.10)  # EUR/USD cadangan bila gagal diambil
 
 
@@ -523,7 +523,7 @@ def main():
     zs = pick_zone(zones, False, price, gap) or fallback_zone(False, price, gap, atr_ref, highs, lows, first)
 
     near_sides = [(buy, z) for buy, z in ((True, zb), (False, zs)) if z and is_near(z, buy, price)]
-    hourly = SUMMARY and wib.minute < 10
+    hourly = SUMMARY and (os.environ.get("SUMMARY_NOW", "").strip() == "1")
     alert_ok = FORCE or (wib.minute % ALERT_EVERY) < 10
     send_alert = bool(near_sides) and alert_ok
     send_summary = (hourly or FORCE) and not near_sides
