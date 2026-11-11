@@ -1,31 +1,36 @@
-name: AtoBot uji historis
+name: AtoBot saran XAUUSD
 
 on:
-  workflow_dispatch:            # jalankan manual lewat tombol "Run workflow"
+  schedule:
+    - cron: "*/10 * * * *"     # cek tiap 10 menit (GitHub bisa terlambat atau melewatkan)
+    - cron: "0 * * * *"        # ringkasan tiap jam
+  workflow_dispatch:            # tombol "Run workflow" untuk coba manual
 
 jobs:
-  uji:
+  saran:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: pip install requests
-      - name: Jalankan uji historis
+      - name: Jalankan bot
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TWELVE_API_KEY: ${{ secrets.TWELVE_API_KEY }}
-          MODE: "scalp"
-          STEP: "4"
-          M15_TOTAL: "10000"
-        run: python backtest.py
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: hasil-uji
-          path: |
-            backtest_hasil.csv
-            backtest_ringkasan.txt
+          EQUITY: "990"
+          CCY: "EUR"
+          RISK: "1.0"
+          LAYERS: "2"
+          MODE: "scalp"          # scalp = zona M15+M30 (peta H1); swing = zona H1+H4
+          FAR_ATR: "1.5"
+          ALERT_EVERY: "10"
+          SUMMARY_NOW: ${{ github.event.schedule == '0 * * * *' && '1' || '' }}
+          PAUSE: ${{ vars.PAUSE }}                 # isi 1 di Settings > Variables untuk menjeda bot
+          SESSION_ONLY: ${{ vars.SESSION_ONLY }}   # 1 = alert hanya saat sesi London/New York
+          USE_US10Y: ${{ vars.USE_US10Y }}         # 1 = tampilkan arah yield AS 10 tahun (eksperimen)
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && '1' || '' }}
+        run: python atobot_cloud.py
