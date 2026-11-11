@@ -1,0 +1,31 @@
+name: AtoBot uji historis
+
+on:
+  workflow_dispatch:            # jalankan manual lewat tombol "Run workflow"
+
+jobs:
+  uji:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - name: Jalankan uji historis
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TWELVE_API_KEY: ${{ secrets.TWELVE_API_KEY }}
+          MODE: "scalp"
+          STEP: "4"
+          M15_TOTAL: "10000"
+        run: python backtest.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hasil-uji
+          path: |
+            backtest_hasil.csv
+            backtest_ringkasan.txt
