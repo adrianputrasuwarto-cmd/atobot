@@ -13,6 +13,9 @@ Pengaturan opsional (GitHub Variables / env):
   MODE=scalp (zona M15+M30, peta H1) atau swing (zona H1+H4)
   FAR_ATR=1.5  ALERT_EVERY=30 (menit, jeda alert dekat zona)
   FORCE=1  -> kirim ringkasan sekarang (dipakai tombol Run manual)
+  PAUSE=1  -> bot dijeda (tidak kirim apa pun kecuali Run manual). Atur di Settings > Variables
+  SESSION_ONLY=1 -> alert dekat zona hanya saat sesi London/New York
+  USE_US10Y=1 (+ US10Y_SYMBOL) -> tampilkan arah yield AS 10 tahun (eksperimen, +1 permintaan data)
   MOCK=1   -> data tiruan untuk uji tanpa internet (tidak kirim Telegram)
 """
 import datetime as dt
@@ -452,6 +455,147 @@ def fmt_plan(pl):
     return "\n".join(lines)
 
 
+
+# ------------------------------------------------------------------ bias (v3)
+def ema_last(closes, p):
+    k, e = 2.0 / (p + 1), closes[0]
+    for v in closes[1:]:
+        e = v * k + e * (1 - k)
+    return e
+
+
+def trend_of(b):
+    """Kompas trend dari candle tertutup (terbaru dulu): (teks, arah) arah +1 naik, -1 turun, 0 sideways."""
+    closes = [x["c"] for x in reversed(b[:120])]
+    if len(closes) < 55:
+        return "n/a", 0
+    e20, e50 = ema_last(closes, 20), ema_last(closes, 50)
+    atr = atr14(b)
+    if abs(e20 - e50) < 0.15 * atr:
+        return "SIDEWAYS", 0
+    if e20 > e50 and b[0]["c"] > e50:
+        return "NAIK", 1
+    if e20 < e50 and b[0]["c"] < e50:
+        return "TURUN", -1
+    return "SIDEWAYS", 0
+
+
+def zscore(b, n=20):
+    xs = [x["c"] for x in b[:n]]
+    m = sum(xs) / len(xs)
+    sd = (sum((v - m) ** 2 for v in xs) / len(xs)) ** 0.5
+    return 0.0 if sd == 0 else (b[0]["c"] - m) / sd
+
+
+def rsi14(b):
+    cl = [x["c"] for x in reversed(b[:15])]
+    g = sum(max(0, cl[i] - cl[i - 1]) for i in range(1, len(cl))) / 14.0
+    l = sum(max(0, cl[i - 1] - cl[i]) for i in range(1, len(cl))) / 14.0
+    return 100.0 if l == 0 else 100 - 100 / (1 + g / l)
+
+
+def z_label(z):
+    if z >= 2:
+        return "sangat tinggi (rawan koreksi)"
+    if z >= 1:
+        return "agak tinggi"
+    if z <= -2:
+        return "sangat rendah (rawan pantul)"
+    if z <= -1:
+        return "agak rendah"
+    return "normal"
+
+
+def session_info(now):
+    h = now.hour    # UTC
+    wib = (now + dt.timedelta(hours=7)).strftime("%H:%M")
+    if 0 <= h < 7:
+        name, liquid = "Asia (cenderung sepi, sering sideways)", False
+    elif 7 <= h < 13:
+        name, liquid = "London (mulai ramai)", True
+    elif 13 <= h < 17:
+        name, liquid = "London + New York (paling ramai, volatil)", True
+    elif 17 <= h < 21:
+        name, liquid = "New York sore (mulai tenang)", True
+    else:
+        name, liquid = "Sepi / pergantian hari (spread bisa melebar)", False
+    return f"Sesi {name} | {wib} WIB", liquid
+
+
+def us10y_text():
+    if os.environ.get("USE_US10Y", "").strip() != "1":
+        return None
+    sym = os.environ.get("US10Y_SYMBOL", "US10Y").strip() or "US10Y"
+    try:
+        d = td_get("time_series", symbol=sym, interval="1h", outputsize=30)
+        v = [float(x["close"]) for x in (d.get("values") or [])]
+        if len(v) < 10:
+            return "US10Y: data tidak tersedia"
+        chg = v[0] - v[min(len(v) - 1, 24)]
+        if chg < -0.02:
+            return f"US10Y {v[0]:.2f}% turun 24 jam (cenderung mendukung emas)"
+        if chg > 0.02:
+            return f"US10Y {v[0]:.2f}% naik 24 jam (cenderung menekan emas)"
+        return f"US10Y {v[0]:.2f}% datar 24 jam"
+    except Exception:
+        return "US10Y: data tidak tersedia"
+
+
+def compute_bias(bars, now, mock):
+    h1 = bars.get("H1")
+    h4 = bars.get("H4")
+    if h4 is None:
+        try:
+            h4 = mock_bars(120, 12.0, 7) if mock else get_bars("4h", 120)[0]
+        except Exception:
+            h4 = None
+    t1, d1_ = trend_of(h1) if h1 else ("n/a", 0)
+    t4, d4_ = trend_of(h4) if h4 else ("n/a", 0)
+    ref = h1 or bars[list(bars)[0]]
+    z, r = zscore(ref), rsi14(ref)
+    sess, liquid = session_info(now)
+    arr = {"NAIK": "▲", "TURUN": "▼", "SIDEWAYS": "↔", "n/a": "?"}
+    lines = [f"🧭 BIAS: H1 {t1} {arr[t1]} | H4 {t4} {arr[t4]}",
+             f"Z-Score H1 {z:+.1f} ({z_label(z)}) | RSI H1 {r:.0f}",
+             sess]
+    u = None if mock else us10y_text()
+    if u:
+        lines.append(u)
+    return {"text": "\n".join(lines), "h1": d1_, "h4": d4_, "liquid": liquid}
+
+
+def reaction(b15, z, buy):
+    r = b15[0]
+    rng = r["h"] - r["l"]
+    if rng <= 0:
+        return False
+    if buy:
+        return r["l"] <= z["top"] and (min(r["o"], r["c"]) - r["l"]) / rng >= 0.5 and r["c"] > z["bottom"]
+    return r["h"] >= z["bottom"] and (r["h"] - max(r["o"], r["c"])) / rng >= 0.5 and r["c"] < z["top"]
+
+
+def plan_notes(pl, bias, b15, z):
+    out = []
+    d = bias["h1"]
+    if d == 0:
+        out.append("   ↔ H1 sideways: zona lebih mungkin bertahan, tetap tunggu konfirmasi.")
+    elif (pl["buy"] and d > 0) or ((not pl["buy"]) and d < 0):
+        out.append("   ✅ Searah trend H1.")
+    else:
+        out.append("   ⚠️ MELAWAN trend H1 (counter-trend): tunggu konfirmasi, ambil profit lebih cepat, lot lebih kecil.")
+    if bias["h4"] != 0 and d != 0 and bias["h4"] != d:
+        out.append("   ⚠️ H1 dan H4 beda arah: sinyal kurang bersih.")
+    if is_near(z, pl["buy"], b15[0]["c"]):
+        if reaction(b15, z, pl["buy"]):
+            out.append("   🕯️ Ada wick penolakan di candle M15 terakhir (petunjuk saja, belum terbukti di uji).")
+        else:
+            out.append("   🕯️ Belum ada tanda reaksi di zona: tunggu konfirmasi sendiri.")
+    return "\n".join(out)
+
+FOOT = ("Saran saja, bukan perintah. Uji historis 3-10 bulan: zona ini sekitar impas, jadi pakai sebagai PETA level, "
+        "tunggu konfirmasi sendiri, SL selalu terpasang. Hindari entry saat rilis data besar.")
+
+
 # ------------------------------------------------------------------ kirim
 def tg_send(text):
     r = requests.post(
@@ -485,6 +629,10 @@ def diag_text(zones, stats, price):
 def main():
     now = dt.datetime.now(dt.timezone.utc)
     wib = now + dt.timedelta(hours=7)
+    paused = os.environ.get("PAUSE", "").strip().lower() in ("1", "on", "true", "ya", "yes")
+    if paused and not FORCE and not MOCK:
+        print("Bot DIJEDA (variabel PAUSE). Tidak ada yang dikirim.")
+        return 0
 
     if not MOCK:
         if not (TG_TOKEN and TG_CHAT and TD_KEY):
@@ -526,7 +674,9 @@ def main():
     hourly = SUMMARY and (os.environ.get("SUMMARY_NOW", "").strip() == "1")
     alert_ok = FORCE or (wib.minute % ALERT_EVERY) < 10
     send_alert = bool(near_sides) and alert_ok
-    send_summary = (hourly or FORCE) and not near_sides
+    if send_alert and os.environ.get("SESSION_ONLY", "").strip() == "1" and not FORCE and not session_info(now)[1]:
+        send_alert = False
+    send_summary = (hourly or FORCE) and not (near_sides and send_alert)
 
     names = "+".join(n for n, _, _, _ in cfg)
     if not (send_alert or send_summary):
@@ -542,27 +692,30 @@ def main():
         else:
             d1, _ = get_bars("1day", 20)
             upc = usd_per_ccy()
+    bias = compute_bias(bars, now, MOCK)
+    b15 = bars[first]
     pv = pivots_d1(d1)
     pb = build_plan(True, zb, zones, price, pv, upc) if zb else None
     ps = build_plan(False, zs, zones, price, pv, upc) if zs else None
 
     head = (f"XAUUSD | {wib:%d %b %H:%M} WIB | harga {p2(price)} | ATR {first} {atr_ref:.1f}\n"
-            f"Mode {MODE.upper()} ({names}) | Pivot D1: PP {p2(pv[0])} R1 {p2(pv[1])} S1 {p2(pv[2])}")
+            f"Mode {MODE.upper()} ({names}) | Pivot D1: PP {p2(pv[0])} R1 {p2(pv[1])} S1 {p2(pv[2])}\n"
+            + bias["text"] + ("\n⏸ Bot sedang DIJEDA, ini hasil jalan manual." if paused else ""))
     msgs = []
 
     if send_alert:
         txt = ["🔔 HARGA DEKAT ZONA", head, ""]
         for pl in (pb, ps):
             if pl and ((pl["buy"] and is_near(zb, True, price)) or ((not pl["buy"]) and is_near(zs, False, price))):
-                txt += [fmt_plan(pl), ""]
-        txt.append("Saran saja. Cek berita dan spread sebelum entry.")
+                txt += [fmt_plan(pl), plan_notes(pl, bias, b15, zb if pl["buy"] else zs), ""]
+        txt.append(FOOT)
         msgs.append("\n".join(txt))
     if send_summary or MOCK:
         txt = ["📊 RINGKASAN", head, ""]
-        txt.append(fmt_plan(pb) if pb else "▲ BUY: tidak ada zona demand atau support swing di bawah harga.")
+        txt.append((fmt_plan(pb) + "\n" + plan_notes(pb, bias, b15, zb)) if pb else "▲ BUY: tidak ada zona demand atau support swing di bawah harga.")
         txt.append("")
-        txt.append(fmt_plan(ps) if ps else "▼ SELL: tidak ada zona supply atau resistance swing di atas harga.")
-        txt += ["", diag_text(zones, stats, price), "Saran saja, bukan perintah. Hindari entry saat rilis data besar."]
+        txt.append((fmt_plan(ps) + "\n" + plan_notes(ps, bias, b15, zs)) if ps else "▼ SELL: tidak ada zona supply atau resistance swing di atas harga.")
+        txt += ["", diag_text(zones, stats, price), FOOT]
         summary_msg = "\n".join(txt)
         if send_summary:
             msgs.append(summary_msg)
